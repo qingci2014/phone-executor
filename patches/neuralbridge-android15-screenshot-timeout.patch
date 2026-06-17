@@ -1,0 +1,37 @@
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt
+--- a/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt
+@@
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+             // Android 14+: must specify foreground service type matching manifest declaration
+-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
++            val foregroundServiceType =
++                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
++                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
++            startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
+         } else {
+             startForeground(NOTIFICATION_ID, notification)
+         }
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt
+--- a/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt
+@@
+                 }
+ 
+                 try {
+-                    val bitmap = captureViaAccessibilityService()
++                    val bitmap = withTimeout(IMAGE_READER_TIMEOUT_MS) {
++                        captureViaAccessibilityService()
++                    }
+                     try {
+                         val jpegBytes = encodeToJpeg(bitmap, quality)
+                         val elapsedMs = System.currentTimeMillis() - startTime
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt
+--- a/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt
+@@
+-        val jpegBytes = screenshotPipeline.capture(quality)
++        val jpegBytes = withTimeout(15000L) {
++            screenshotPipeline.capture(quality)
++        }
+         val base64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)

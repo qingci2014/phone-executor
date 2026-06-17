@@ -1,0 +1,526 @@
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index 26ab445..8783842 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -15,6 +15,7 @@ android {
+         targetSdk = 34
+         versionCode = 1
+         versionName = "0.1.0"
++        manifestPlaceholders["usesCleartextTraffic"] = "false"
+ 
+         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+ 
+@@ -43,6 +44,7 @@ android {
+     buildTypes {
+         release {
+             isMinifyEnabled = false
++            manifestPlaceholders["usesCleartextTraffic"] = "false"
+             proguardFiles(
+                 getDefaultProguardFile("proguard-android-optimize.txt"),
+                 "proguard-rules.pro"
+@@ -50,6 +52,7 @@ android {
+         }
+         debug {
+             isDebuggable = true
++            manifestPlaceholders["usesCleartextTraffic"] = "true"
+         }
+     }
+ 
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index c1114a4..781444e 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -38,6 +38,7 @@
+         android:icon="@mipmap/ic_launcher"
+         android:roundIcon="@mipmap/ic_launcher"
+         android:label="@string/app_name"
++        android:usesCleartextTraffic="${usesCleartextTraffic}"
+         android:supportsRtl="true"
+         android:theme="@style/Theme.NeuralBridge"
+         tools:targetApi="31">
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/MainActivity.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/MainActivity.kt
+index c5a6ee4..6765876 100644
+--- a/android/app/src/main/kotlin/com/neuralbridge/companion/MainActivity.kt
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/MainActivity.kt
+@@ -103,6 +103,7 @@ class MainActivity : Activity() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         setContentView(R.layout.activity_main)
++        applyCloudConfigFromIntent(intent)
+ 
+         findViews()
+         setupTabs()
+@@ -114,6 +115,13 @@ class MainActivity : Activity() {
+         updateAllPermissionStatus()
+     }
+ 
++    override fun onNewIntent(intent: Intent) {
++        super.onNewIntent(intent)
++        setIntent(intent)
++        applyCloudConfigFromIntent(intent)
++        updateServiceStatus()
++    }
++
+     override fun onResume() {
+         super.onResume()
+         NeuralBridgeAccessibilityService.instance?.tryConsumeMediaProjectionConsent()
+@@ -121,6 +129,35 @@ class MainActivity : Activity() {
+         statusHandler.post(statusRunnable)
+     }
+ 
++    private fun applyCloudConfigFromIntent(intent: Intent?) {
++        if (!BuildConfig.DEBUG) return
++        if (intent == null) return
++
++        val hasCloudConfig =
++            intent.hasExtra("cloud_enabled") ||
++                intent.hasExtra("cloud_gateway_url") ||
++                intent.hasExtra("cloud_token") ||
++                intent.hasExtra("cloud_device_id") ||
++                intent.hasExtra("cloud_device_name")
++        if (!hasCloudConfig) return
++
++        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
++        val editor = prefs.edit()
++
++        if (intent.hasExtra("cloud_enabled")) {
++            editor.putBoolean("cloud_enabled", intent.getBooleanExtra("cloud_enabled", false))
++        }
++        intent.getStringExtra("cloud_gateway_url")?.let { editor.putString("cloud_gateway_url", it) }
++        intent.getStringExtra("cloud_token")?.let { editor.putString("cloud_token", it) }
++        intent.getStringExtra("cloud_device_id")?.let { editor.putString("cloud_device_id", it) }
++        intent.getStringExtra("cloud_device_name")?.let { editor.putString("cloud_device_name", it) }
++        editor.apply()
++
++        NeuralBridgeAccessibilityService.instance?.refreshCloudGatewayClient()
++        Toast.makeText(this, "Cloud gateway config updated", Toast.LENGTH_SHORT).show()
++        Log.i("NeuralBridge", "Cloud gateway config updated from launch intent")
++    }
++
+     override fun onPause() {
+         super.onPause()
+         statusHandler.removeCallbacks(statusRunnable)
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/CloudGatewayClient.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/CloudGatewayClient.kt
+new file mode 100644
+index 0000000..fee778c
+--- /dev/null
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/CloudGatewayClient.kt
+@@ -0,0 +1,253 @@
++package com.neuralbridge.companion.mcp
++
++import android.util.Log
++import com.neuralbridge.companion.log.CommandLog
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.buildJsonArray
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.contentOrNull
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import kotlinx.serialization.json.put
++import kotlinx.serialization.json.putJsonObject
++import java.io.BufferedReader
++import java.io.InputStreamReader
++import java.io.OutputStreamWriter
++import java.net.HttpURLConnection
++import java.net.URL
++import java.net.URLEncoder
++
++/**
++ * Pull-based cloud bridge.
++ *
++ * The phone keeps an outbound connection pattern to the Gateway:
++ * register -> poll task -> execute locally -> post result.
++ */
++class CloudGatewayClient(
++    private val scope: CoroutineScope,
++    private val toolHandler: McpToolHandler,
++    private val config: Config
++) {
++    data class Config(
++        val gatewayUrl: String,
++        val deviceId: String,
++        val deviceName: String,
++        val token: String,
++        val pollTimeoutMs: Long = 25_000L
++    )
++
++    companion object {
++        private const val TAG = "CloudGatewayClient"
++        private const val RETRY_DELAY_MS = 3_000L
++    }
++
++    private val json = Json {
++        ignoreUnknownKeys = true
++        encodeDefaults = true
++        explicitNulls = false
++        isLenient = true
++    }
++
++    private var job: Job? = null
++
++    fun start() {
++        if (job?.isActive == true) return
++        job = scope.launch {
++            Log.i(TAG, "Starting cloud gateway client: ${config.gatewayUrl}")
++            while (isActive) {
++                try {
++                    register()
++                    pollLoop()
++                } catch (e: Exception) {
++                    Log.w(TAG, "Cloud gateway loop failed: ${e.message}", e)
++                    delay(RETRY_DELAY_MS)
++                }
++            }
++        }
++    }
++
++    fun stop() {
++        job?.cancel()
++        job = null
++    }
++
++    private suspend fun pollLoop() {
++        while (scope.coroutineContext.isActive) {
++            val task = pollTask() ?: continue
++            executeAndReport(task)
++        }
++    }
++
++    private suspend fun register() {
++        val body = buildJsonObject {
++            put("device_id", config.deviceId)
++            put("name", config.deviceName)
++            put("executor_version", "neuralbridge-cloud-0.1")
++        }
++        postJson("/device/register", body, 10_000)
++        Log.i(TAG, "Registered cloud device: ${config.deviceId}")
++    }
++
++    private suspend fun pollTask(): JsonObject? {
++        val device = urlEncode(config.deviceId)
++        val path = "/device/$device/poll?timeout_ms=${config.pollTimeoutMs}"
++        val response = requestJson("GET", path, null, config.pollTimeoutMs + 5_000)
++        if (response.statusCode == HttpURLConnection.HTTP_NO_CONTENT) return null
++        if (response.statusCode !in 200..299) {
++            throw IllegalStateException("Poll failed: HTTP ${response.statusCode} ${response.body}")
++        }
++        val body = response.body ?: return null
++        return json.parseToJsonElement(body).jsonObject
++    }
++
++    private suspend fun executeAndReport(task: JsonObject) {
++        val taskId = task["task_id"]?.jsonPrimitive?.contentOrNull ?: ""
++        val stepId = task["step_id"]?.jsonPrimitive?.contentOrNull ?: ""
++        val action = task["action"]?.jsonPrimitive?.contentOrNull ?: ""
++        val tool = task["tool"]?.jsonPrimitive?.contentOrNull ?: ""
++        val arguments = task["arguments"]?.jsonObject ?: JsonObject(emptyMap())
++        val startedAt = System.currentTimeMillis()
++
++        val result = try {
++            val toolResult = toolHandler.handleToolCall(tool, arguments)
++            val durationMs = (System.currentTimeMillis() - startedAt).toInt()
++            CommandLog.add(CommandLog.Entry(
++                timestamp = startedAt,
++                command = "cloud:$tool",
++                latencyMs = durationMs,
++                success = !toolResult.isError,
++                category = CommandLog.Category.CONNECT
++            ))
++
++            buildResultBody(
++                taskId = taskId,
++                stepId = stepId,
++                action = action,
++                tool = tool,
++                status = if (toolResult.isError) "error" else "ok",
++                startedAt = startedAt,
++                durationMs = durationMs,
++                mcp = buildJsonObject {
++                    putJsonObject("result") {
++                        put("isError", JsonPrimitive(toolResult.isError))
++                        put("content", buildJsonArray {
++                            toolResult.content.forEach { block ->
++                                add(buildJsonObject {
++                                    put("type", block.type)
++                                    block.text?.let { put("text", it) }
++                                    block.data?.let { put("data", it) }
++                                    block.mimeType?.let { put("mimeType", it) }
++                                })
++                            }
++                        })
++                    }
++                }
++            )
++        } catch (e: Exception) {
++            val durationMs = (System.currentTimeMillis() - startedAt).toInt()
++            Log.e(TAG, "Cloud task failed: $tool", e)
++            CommandLog.add(CommandLog.Entry(
++                timestamp = startedAt,
++                command = "cloud:$tool",
++                latencyMs = durationMs,
++                success = false,
++                category = CommandLog.Category.CONNECT
++            ))
++
++            buildResultBody(
++                taskId = taskId,
++                stepId = stepId,
++                action = action,
++                tool = tool,
++                status = "error",
++                startedAt = startedAt,
++                durationMs = durationMs,
++                error = e.message ?: "unknown error"
++            )
++        }
++
++        val device = urlEncode(config.deviceId)
++        postJson("/device/$device/result", result, 15_000)
++    }
++
++    private fun buildResultBody(
++        taskId: String,
++        stepId: String,
++        action: String,
++        tool: String,
++        status: String,
++        startedAt: Long,
++        durationMs: Int,
++        mcp: JsonObject? = null,
++        error: String? = null
++    ): JsonObject = buildJsonObject {
++        put("task_id", taskId)
++        put("step_id", stepId)
++        put("device_id", config.deviceId)
++        put("action", action)
++        put("tool", tool)
++        put("status", status)
++        put("started_at", startedAt.toString())
++        put("duration_ms", durationMs)
++        mcp?.let { put("mcp", it) }
++        error?.let { put("error", it) }
++    }
++
++    private suspend fun postJson(path: String, body: JsonObject, timeoutMs: Long): HttpResponse =
++        requestJson("POST", path, body.toString(), timeoutMs)
++
++    private suspend fun requestJson(
++        method: String,
++        path: String,
++        body: String?,
++        timeoutMs: Long
++    ): HttpResponse = withContext(Dispatchers.IO) {
++        val url = URL(config.gatewayUrl.trimEnd('/') + path)
++        val connection = (url.openConnection() as HttpURLConnection).apply {
++            requestMethod = method
++            connectTimeout = timeoutMs.toInt()
++            readTimeout = timeoutMs.toInt()
++            setRequestProperty("Authorization", "Bearer ${config.token}")
++            setRequestProperty("Accept", "application/json")
++            setRequestProperty("Connection", "close")
++            if (body != null) {
++                doOutput = true
++                setRequestProperty("Content-Type", "application/json; charset=utf-8")
++            }
++        }
++
++        try {
++            if (body != null) {
++                OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
++                    writer.write(body)
++                }
++            }
++
++            val statusCode = connection.responseCode
++            val stream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
++            val responseBody = stream?.use { input ->
++                BufferedReader(InputStreamReader(input, Charsets.UTF_8)).readText()
++            }
++            HttpResponse(statusCode, responseBody)
++        } finally {
++            connection.disconnect()
++        }
++    }
++
++    private fun urlEncode(value: String): String =
++        URLEncoder.encode(value, "UTF-8")
++
++    private data class HttpResponse(
++        val statusCode: Int,
++        val body: String?
++    )
++}
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt
+index b8f9b53..d9eb398 100644
+--- a/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/mcp/McpToolHandler.kt
+@@ -173,7 +173,9 @@ class McpToolHandler(
+         val quality = if (args["quality"]?.jsonPrimitive?.contentOrNull == "thumbnail")
+             ScreenshotQuality.THUMBNAIL else ScreenshotQuality.FULL
+ 
+-        val jpegBytes = screenshotPipeline.capture(quality)
++        val jpegBytes = withTimeout(15000L) {
++            screenshotPipeline.capture(quality)
++        }
+         val base64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+         val dm = service.resources.displayMetrics
+         val meta = buildJsonObject {
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt
+index 65f0edd..80120f3 100644
+--- a/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/screenshot/ScreenshotPipeline.kt
+@@ -192,7 +192,9 @@ class ScreenshotPipeline(
+                 }
+ 
+                 try {
+-                    val bitmap = captureViaAccessibilityService()
++                    val bitmap = withTimeout(IMAGE_READER_TIMEOUT_MS) {
++                        captureViaAccessibilityService()
++                    }
+                     try {
+                         val jpegBytes = encodeToJpeg(bitmap, quality)
+                         val elapsedMs = System.currentTimeMillis() - startTime
+diff --git a/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt b/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt
+index 9b275f9..36a40ec 100644
+--- a/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt
++++ b/android/app/src/main/kotlin/com/neuralbridge/companion/service/NeuralBridgeAccessibilityService.kt
+@@ -19,6 +19,7 @@ import com.neuralbridge.companion.gesture.GestureEngine
+ import com.neuralbridge.companion.input.InputEngine
+ import com.neuralbridge.companion.uitree.UiTreeWalker
+ import com.neuralbridge.companion.screenshot.ScreenshotPipeline
++import com.neuralbridge.companion.mcp.CloudGatewayClient
+ import com.neuralbridge.companion.mcp.McpHttpServer
+ import com.neuralbridge.companion.mcp.McpToolHandler
+ import kotlinx.coroutines.*
+@@ -73,6 +74,8 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
+ 
+     // MCP HTTP server
+     private var mcpHttpServer: McpHttpServer? = null
++    private var cloudGatewayClient: CloudGatewayClient? = null
++    private var currentToolHandler: McpToolHandler? = null
+ 
+     // Event listener for UI changes (CopyOnWriteArrayList for thread-safe iteration from onAccessibilityEvent)
+     private val eventListeners = java.util.concurrent.CopyOnWriteArrayList<AccessibilityEventListener>()
+@@ -102,11 +105,12 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
+         // Publish instance before conditional startup so MainActivity can query it
+         instance = this
+ 
+-        // Only start foreground service, HTTP server, and screen recording if toggle is on
++        // Only start foreground service and command servers if toggle is on.
++        // MediaProjection consent is no longer requested automatically; the
++        // AccessibilityService screenshot fallback avoids repeated system popups.
+         if (isEnabled()) {
+             startForegroundService()
+             startMcpHttpServer()
+-            requestMediaProjectionPermission()
+         }
+ 
+         Log.i(TAG, "NeuralBridge service fully initialized")
+@@ -155,7 +159,9 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
+             context = this,
+             toolHandler = toolHandler
+         )
++        currentToolHandler = toolHandler
+         mcpHttpServer = server
++        startCloudGatewayClient(toolHandler)
+         serviceScope.launch {
+             try {
+                 server.start()
+@@ -165,6 +171,48 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
+         }
+     }
+ 
++    private fun startCloudGatewayClient(toolHandler: McpToolHandler) {
++        val prefs = getSharedPreferences("neuralbridge_prefs", Context.MODE_PRIVATE)
++        val enabled = prefs.getBoolean("cloud_enabled", false)
++        if (!enabled) {
++            Log.i(TAG, "Cloud gateway client disabled")
++            return
++        }
++
++        val gatewayUrl = prefs.getString("cloud_gateway_url", null)?.trim().orEmpty()
++        val token = prefs.getString("cloud_token", null)?.trim().orEmpty()
++        val deviceId = prefs.getString("cloud_device_id", null)?.trim()
++            ?.takeIf { it.isNotEmpty() }
++            ?: Build.MODEL.replace(Regex("\\s+"), "-").lowercase()
++        val deviceName = prefs.getString("cloud_device_name", null)?.trim()
++            ?.takeIf { it.isNotEmpty() }
++            ?: "${Build.MANUFACTURER} ${Build.MODEL}".trim()
++
++        if (gatewayUrl.isEmpty() || token.isEmpty()) {
++            Log.w(TAG, "Cloud gateway enabled but cloud_gateway_url or cloud_token is missing")
++            return
++        }
++
++        cloudGatewayClient?.stop()
++        cloudGatewayClient = CloudGatewayClient(
++            scope = serviceScope,
++            toolHandler = toolHandler,
++            config = CloudGatewayClient.Config(
++                gatewayUrl = gatewayUrl,
++                deviceId = deviceId,
++                deviceName = deviceName,
++                token = token
++            )
++        ).also { it.start() }
++    }
++
++    fun refreshCloudGatewayClient() {
++        val toolHandler = currentToolHandler ?: return
++        cloudGatewayClient?.stop()
++        cloudGatewayClient = null
++        startCloudGatewayClient(toolHandler)
++    }
++
+     /**
+      * Start service as foreground service
+      */
+@@ -178,7 +226,10 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
+ 
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+             // Android 14+: must specify foreground service type matching manifest declaration
+-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
++            val foregroundServiceType =
++                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
++                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
++            startForeground(NOTIFICATION_ID, notification, foregroundServiceType)
+         } else {
+             startForeground(NOTIFICATION_ID, notification)
+         }
+@@ -463,12 +514,11 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
+     }
+ 
+     /**
+-     * Start MCP server and request MediaProjection — called when user turns on the master toggle
++     * Start MCP server — called when user turns on the master toggle
+      */
+     fun enable() {
+         startForegroundService()
+         startMcpHttpServer()
+-        requestMediaProjectionPermission()
+     }
+ 
+     /**
+@@ -482,10 +532,13 @@ class NeuralBridgeAccessibilityService : AccessibilityService() {
+ 
+         @Suppress("DEPRECATION")
+         stopForeground(true)
++        cloudGatewayClient?.stop()
++        cloudGatewayClient = null
+         mcpHttpServer?.releaseScreenWakeLock()
+         serviceScope.launch {
+             mcpHttpServer?.stop()
+             mcpHttpServer = null
++            currentToolHandler = null
+         }
+     }
+ 

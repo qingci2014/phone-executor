@@ -1,0 +1,24 @@
+[Unit]
+Description=Phone Executor Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/phone-executor/gateway
+Environment=HOST=0.0.0.0
+Environment=PORT=8787
+EnvironmentFile=/opt/phone-executor/gateway/gateway.env
+ExecStart=/usr/bin/node /opt/phone-executor/gateway/server.mjs
+Restart=always
+RestartSec=3
+User=phone-executor
+Group=phone-executor
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

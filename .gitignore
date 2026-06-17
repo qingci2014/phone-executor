@@ -1,0 +1,13 @@
+vendor/
+.tools/
+.tmp/
+*.apk
+*.aab
+*.keystore
+*.jks
+local.properties
+gateway/config.json
+gateway/logs/
+gateway/data/
+gateway/data-test/
+gateway/*.log
