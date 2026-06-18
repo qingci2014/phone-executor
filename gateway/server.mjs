@@ -27,7 +27,11 @@ const TOOL_BY_ACTION = {
   set_text: "android_set_text",
   clear_text: "android_clear_text",
   dismiss_overlay: "android_dismiss_overlay",
-  get_installed_package: "android_get_installed_package"
+  get_installed_package: "android_get_installed_package",
+  get_screen_state: "android_get_screen_state",
+  wake_screen: "android_wake_screen",
+  unlock_device: "android_unlock_device",
+  keep_awake: "android_keep_awake"
 };
 
 let rpcId = 1;
@@ -37,6 +41,7 @@ const completedTasks = new Map();
 const canceledTasks = new Map();
 const pendingConfirmations = new Map();
 const pollWaiters = new Map();
+const deviceOnlineTtlMs = Number(process.env.PHONE_EXECUTOR_DEVICE_ONLINE_TTL_MS || 60 * 1000);
 
 async function loadConfig() {
   const file = existsSync(configPath) ? configPath : defaultConfigPath;
@@ -50,6 +55,7 @@ async function loadConfig() {
   config.defaultTransport = config.defaultTransport || "cloud";
   config.resultTtlMs = Number(config.resultTtlMs || 60 * 60 * 1000);
   config.confirmationRequiredActions = config.confirmationRequiredActions || [];
+  config.wakePush = config.wakePush || {};
   config.baseDir = __dirname;
   return config;
 }
@@ -279,6 +285,199 @@ function setDeviceOnline(deviceId, patch = {}) {
   });
 }
 
+function getDeviceStateView(deviceId) {
+  const state = deviceStates.get(deviceId) || { online: false };
+  const lastSeen = Date.parse(state.last_seen_at || "");
+  if (!Number.isFinite(lastSeen)) {
+    return {
+      ...state,
+      online: false,
+      stale: true,
+      age_ms: null,
+      online_ttl_ms: deviceOnlineTtlMs
+    };
+  }
+
+  const ageMs = Date.now() - lastSeen;
+  const stale = ageMs > deviceOnlineTtlMs;
+  return {
+    ...state,
+    online: Boolean(state.online) && !stale,
+    stale,
+    age_ms: ageMs,
+    online_ttl_ms: deviceOnlineTtlMs
+  };
+}
+
+async function logDeviceEvent(config, event) {
+  try {
+    await appendStoreRecord(config, "device_events.jsonl", {
+      at: new Date().toISOString(),
+      ...event
+    });
+  } catch (error) {
+    console.warn("Failed to write device event log:", error.message);
+  }
+}
+
+async function logWakeEvent(config, event) {
+  try {
+    await appendStoreRecord(config, "wake_events.jsonl", {
+      at: new Date().toISOString(),
+      ...event
+    });
+  } catch (error) {
+    console.warn("Failed to write wake event log:", error.message);
+  }
+}
+
+function publicWakeConfig(config, device) {
+  const wakePush = config.wakePush || {};
+  const deviceWake = device.wakePush || {};
+  return {
+    enabled: Boolean(deviceWake.enabled ?? wakePush.enabled),
+    provider: deviceWake.provider || wakePush.provider || "disabled",
+    timeout_ms: Number(deviceWake.timeoutMs || wakePush.timeoutMs || 30000)
+  };
+}
+
+function scheduleWakeTimeoutCheck(config, device, wakeId, requestedAtMs) {
+  const wake = publicWakeConfig(config, device);
+  const timeoutMs = wake.timeout_ms;
+  setTimeout(() => {
+    const lastSeen = Date.parse(deviceStates.get(device.id)?.last_seen_at || "");
+    if (!Number.isFinite(lastSeen) || lastSeen < requestedAtMs) {
+      logWakeEvent(config, {
+        event: "wake_timeout_no_poll",
+        wake_id: wakeId,
+        device_id: device.id,
+        timeout_ms: timeoutMs
+      });
+    }
+  }, timeoutMs).unref?.();
+}
+
+async function triggerWakePush(config, device, task, reason = "task_queued") {
+  const wakeId = crypto.randomUUID();
+  const requestedAtMs = Date.now();
+  const wake = publicWakeConfig(config, device);
+  const payload = {
+    type: "phone_executor_wake",
+    device_id: device.id,
+    reason,
+    wake_id: wakeId,
+    task_id: task.task_id,
+    step_id: task.step_id,
+    action: task.action,
+    queued_at: task.created_at
+  };
+
+  await logWakeEvent(config, {
+    event: "wake_push_requested",
+    wake_id: wakeId,
+    device_id: device.id,
+    provider: wake.provider,
+    reason,
+    task_id: task.task_id,
+    step_id: task.step_id,
+    action: task.action
+  });
+
+  scheduleWakeTimeoutCheck(config, device, wakeId, requestedAtMs);
+
+  if (!wake.enabled || wake.provider === "disabled") {
+    await logWakeEvent(config, {
+      event: "wake_push_provider_failed",
+      wake_id: wakeId,
+      device_id: device.id,
+      provider: wake.provider,
+      reason: "wake_push_not_configured"
+    });
+    return {
+      wake_id: wakeId,
+      status: "provider_failed",
+      provider: wake.provider,
+      reason: "wake_push_not_configured"
+    };
+  }
+
+  if (wake.provider === "webhook") {
+    const webhookUrl = device.wakePush?.webhookUrl || config.wakePush?.webhookUrl;
+    if (!webhookUrl) {
+      await logWakeEvent(config, {
+        event: "wake_push_provider_failed",
+        wake_id: wakeId,
+        device_id: device.id,
+        provider: wake.provider,
+        reason: "webhook_url_missing"
+      });
+      return {
+        wake_id: wakeId,
+        status: "provider_failed",
+        provider: wake.provider,
+        reason: "webhook_url_missing"
+      };
+    }
+
+    try {
+      const headers = {
+        "content-type": "application/json",
+        "accept": "application/json",
+        ...(config.wakePush?.webhookHeaders || {}),
+        ...(device.wakePush?.webhookHeaders || {})
+      };
+      await fetchJson(webhookUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload)
+      }, Number(device.wakePush?.providerTimeoutMs || config.wakePush?.providerTimeoutMs || 10000));
+      await logWakeEvent(config, {
+        event: "wake_push_provider_accepted",
+        wake_id: wakeId,
+        device_id: device.id,
+        provider: wake.provider
+      });
+      return { wake_id: wakeId, status: "accepted", provider: wake.provider };
+    } catch (error) {
+      await logWakeEvent(config, {
+        event: "wake_push_provider_failed",
+        wake_id: wakeId,
+        device_id: device.id,
+        provider: wake.provider,
+        reason: error.message,
+        detail: error.body || null
+      });
+      return {
+        wake_id: wakeId,
+        status: "provider_failed",
+        provider: wake.provider,
+        reason: error.message
+      };
+    }
+  }
+
+  await logWakeEvent(config, {
+    event: "wake_push_provider_failed",
+    wake_id: wakeId,
+    device_id: device.id,
+    provider: wake.provider,
+    reason: "provider_not_implemented",
+    required_materials: [
+      "Honor/HMS developer account",
+      "AppID",
+      "package name",
+      "signing certificate SHA-256",
+      "push server key/client secret/access token flow"
+    ]
+  });
+  return {
+    wake_id: wakeId,
+    status: "provider_failed",
+    provider: wake.provider,
+    reason: "provider_not_implemented"
+  };
+}
+
 function enqueueRemoteTask(device, body) {
   const taskId = body.task_id || crypto.randomUUID();
   const stepId = body.step_id || crypto.randomUUID();
@@ -318,7 +517,16 @@ async function enqueueTask(config, device, body) {
     ...task,
     queued_at_ms: Date.now()
   });
-  return queued;
+  await logDeviceEvent(config, {
+    event: "task_queued",
+    device_id: device.id,
+    task_id: task.task_id,
+    step_id: task.step_id,
+    action: task.action,
+    tool: task.tool
+  });
+  const wake = await triggerWakePush(config, device, task, "task_queued");
+  return { ...queued, wake };
 }
 
 function pruneCompletedTasks(config) {
@@ -666,6 +874,18 @@ async function handleRawMcp(config, body) {
 async function handleRequest(config, req, res) {
   const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
 
+  if (url.pathname === "/device/register" || url.pathname.startsWith("/device/")) {
+    await logDeviceEvent(config, {
+      event: "device_request",
+      method: req.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams.entries()),
+      remote_addr: req.socket?.remoteAddress || null,
+      user_agent: req.headers["user-agent"] || null,
+      has_authorization: Boolean(req.headers.authorization)
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/health") {
     const deviceId = url.searchParams.get("device_id");
     const body = {
@@ -677,7 +897,7 @@ async function handleRequest(config, req, res) {
     if (deviceId) {
       const device = selectDevice(config, deviceId);
       body.device_id = device.id;
-      body.device = deviceStates.get(device.id) || { online: false };
+      body.device = getDeviceStateView(device.id);
 
       if (config.enableLocalMcpProxy === true && url.searchParams.get("check_local") === "true" && device.healthUrl) {
         try {
@@ -699,7 +919,7 @@ async function handleRequest(config, req, res) {
           id: device.id,
           name: device.name,
           transport: device.transport || config.defaultTransport || "cloud",
-          state: deviceStates.get(device.id) || { online: false }
+          state: getDeviceStateView(device.id)
         };
         if (config.enableLocalMcpProxy === true) {
           view.mcpUrl = device.mcpUrl || null;
@@ -749,6 +969,14 @@ async function handleRequest(config, req, res) {
       name: body.name || device.name,
       executor_version: body.executor_version || null
     });
+    await logDeviceEvent(config, {
+      event: "register",
+      device_id: device.id,
+      name: body.name || device.name,
+      executor_version: body.executor_version || null,
+      remote_addr: req.socket?.remoteAddress || null,
+      user_agent: req.headers["user-agent"] || null
+    });
     return jsonResponse(res, 200, {
       status: "ok",
       device_id: device.id,
@@ -756,13 +984,67 @@ async function handleRequest(config, req, res) {
     });
   }
 
+  const wakeSignalMatch = url.pathname.match(/^\/device\/([^/]+)\/wake-signal$/);
+  if (req.method === "POST" && wakeSignalMatch) {
+    requireDeviceAuth(config, req);
+    const device = selectDevice(config, decodeURIComponent(wakeSignalMatch[1]));
+    const body = await readJsonBody(req);
+    setDeviceOnline(device.id);
+    const event = body.event || "wake_signal_received_by_phone";
+    await logWakeEvent(config, {
+      event,
+      wake_id: body.wake_id || null,
+      device_id: device.id,
+      task_id: body.task_id || null,
+      step_id: body.step_id || null,
+      status: body.status || null,
+      detail: body.detail || null,
+      remote_addr: req.socket?.remoteAddress || null,
+      user_agent: req.headers["user-agent"] || null
+    });
+    if (event === "phone_poll_after_wake" || event === "one_shot_poll_start") {
+      await logDeviceEvent(config, {
+        event: "phone_poll_after_wake",
+        wake_id: body.wake_id || null,
+        device_id: device.id
+      });
+    }
+    return jsonResponse(res, 200, { status: "ok" });
+  }
+
   const pollMatch = url.pathname.match(/^\/device\/([^/]+)\/poll$/);
   if (req.method === "GET" && pollMatch) {
     requireDeviceAuth(config, req);
     const device = selectDevice(config, decodeURIComponent(pollMatch[1]));
     setDeviceOnline(device.id);
-    const task = await waitForRemoteTask(device.id, Number(url.searchParams.get("timeout_ms") || 25000));
-    if (!task) return jsonResponse(res, 204, {});
+    const timeoutMs = Number(url.searchParams.get("timeout_ms") || 25000);
+    await logDeviceEvent(config, {
+      event: "poll_start",
+      device_id: device.id,
+      timeout_ms: timeoutMs,
+      remote_addr: req.socket?.remoteAddress || null,
+      user_agent: req.headers["user-agent"] || null
+    });
+    const task = await waitForRemoteTask(device.id, timeoutMs);
+    if (!task) {
+      await logDeviceEvent(config, {
+        event: "poll_response",
+        device_id: device.id,
+        status: "no_task",
+        http_status: 204
+      });
+      return jsonResponse(res, 204, {});
+    }
+    await logDeviceEvent(config, {
+      event: "poll_response",
+      device_id: device.id,
+      status: "task",
+      http_status: 200,
+      task_id: task.task_id,
+      step_id: task.step_id,
+      action: task.action,
+      tool: task.tool
+    });
     return jsonResponse(res, 200, task);
   }
 
@@ -782,6 +1064,17 @@ async function handleRequest(config, req, res) {
     pruneCompletedTasks(config);
     completedTasks.set(key, result);
     await appendStoreRecord(config, "results.jsonl", result);
+    await logDeviceEvent(config, {
+      event: "result",
+      device_id: device.id,
+      task_id: body.task_id || null,
+      step_id: body.step_id || null,
+      action: body.action || null,
+      tool: body.tool || null,
+      status: body.status || "reported",
+      remote_addr: req.socket?.remoteAddress || null,
+      user_agent: req.headers["user-agent"] || null
+    });
     await writeStepLog(config, {
       task_id: body.task_id,
       step_id: body.step_id,

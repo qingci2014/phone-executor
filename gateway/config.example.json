@@ -18,5 +18,13 @@
       "name": "HONOR ALI-AN00",
       "transport": "cloud"
     }
-  ]
+  ],
+  "wakePush": {
+    "enabled": false,
+    "provider": "disabled",
+    "timeoutMs": 30000,
+    "providerTimeoutMs": 10000,
+    "webhookUrl": "",
+    "webhookHeaders": {}
+  }
 }
